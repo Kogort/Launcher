@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "KogortMC (1)",
+      "ip": "play.kogortmc.ru"
+    },
+    {
+      "name": "KogortMC (2)",
+      "ip": "mc.kogortmc.ru"
+    }
+  ]
+}
