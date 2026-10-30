@@ -128,9 +128,13 @@ jobs:
 
           jq -r '.files[] | [.path, .sha256, (.size|tostring), .urls[0]] | @tsv' index.json |
           while IFS=$'\t' read -r path sha size url; do
-            [[ "$path" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "Bad path: $path"; exit 1; }
-            [[ "$path" != *".."* && "$path" != /* && "$path" != *"\\"* ]] || {
+            # File names contain '+', spaces, parentheses; reject only traversal,
+            # absolute paths, backslashes and control characters.
+            [[ -n "$path" && "$path" != /* && "$path" != *"\\"* && "$path" != *".."* ]] || {
               echo "Unsafe path: $path"; exit 1;
+            }
+            [[ "$path" != *$'\t'* && "$path" != *$'\n'* ]] || {
+              echo "Control character in path: $path"; exit 1;
             }
             [[ "$sha" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad sha: $path"; exit 1; }
             [[ "$size" =~ ^[0-9]+$ ]] || { echo "Bad size: $path"; exit 1; }
@@ -138,7 +142,10 @@ jobs:
 
             mkdir -p "staging/$(dirname "$path")"
             curl -fsSL --retry 3 --retry-delay 2 "$url" -o "staging/$path"
-            echo "$sha  staging/$path" | sha256sum -c -
+            actual_sha="$(sha256sum "staging/$path" | cut -d' ' -f1)"
+            [[ "$actual_sha" == "$sha" ]] || {
+              echo "Sha mismatch: $path ($actual_sha != $sha)"; exit 1;
+            }
             actual="$(stat -c%s "staging/$path")"
             [[ "$actual" == "$size" ]] || {
               echo "Size mismatch: $path ($actual != $size)"; exit 1;
