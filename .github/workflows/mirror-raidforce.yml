@@ -98,7 +98,7 @@ jobs:
           POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
           REMOTE_VERSION=""
           REMOTE_SHA=""
-          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json; then
+          if curl -fsSL --retry 2 "$POINTER_URL?t=$(date +%s)" -o remote-pack.json; then
             REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
             REMOTE_SHA="$(jq -r '.sha256 // empty' remote-pack.json)"
           fi
@@ -249,16 +249,24 @@ jobs:
           cd work
 
           POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
-          curl -fsSL --retry 3 "$POINTER_URL" -o live-pack.json
-          [[ "$(jq -r '.version // empty' live-pack.json)" == "$VERSION" ]] || {
-            echo "Live pack.json has the wrong version"; exit 1;
-          }
-          [[ "$(jq -r '.sha256 // empty' live-pack.json)" == "$ZIP_SHA" ]] || {
-            echo "Live pack.json has the wrong sha256"; exit 1;
+          ok=false
+          for attempt in $(seq 1 20); do
+            if curl -fsSL --retry 2 "$POINTER_URL?t=$(date +%s)" -o live-pack.json; then
+              if [[ "$(jq -r '.version // empty' live-pack.json)" == "$VERSION" \
+                 && "$(jq -r '.sha256 // empty' live-pack.json)" == "$ZIP_SHA" ]]; then
+                ok=true
+                break
+              fi
+            fi
+            echo "pack.json is not visible yet (attempt $attempt/20); waiting..."
+            sleep 3
+          done
+          [[ "$ok" == "true" ]] || {
+            echo "Live pack.json did not become visible"; exit 1;
           }
 
       - name: Delete old zips
-        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && success()
         run: |
           set -euo pipefail
 
