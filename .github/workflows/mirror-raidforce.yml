@@ -1,0 +1,282 @@
+name: Mirror RAIDFORCE pack
+
+# One current RAIDFORCE zip on GitHub, built from the CMS v2 index.
+# The launcher's fallback manifest is:
+#   https://github.com/Kogort/Launcher/releases/download/raidforce-modpack/pack.json
+#
+# No secrets: only the repository GITHUB_TOKEN with contents:write is used.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify only; do not upload or delete anything"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-raidforce
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PACK_SLUG: raidforce
+      RELEASE_TAG: raidforce-modpack
+      CMS_BASE: https://cms.kogort.online/wp-content/uploads/kogort/pack
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+
+    steps:
+      - name: Fetch CMS pointer
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd work
+
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -H "Cache-Control: no-cache" \
+            "$CMS_BASE/$PACK_SLUG/current.json?t=$(date +%s)" \
+            -o current.json
+
+          jq -e . current.json >/dev/null
+          VERSION="$(jq -r '.version // empty' current.json)"
+          INDEX_REL="$(jq -r '.index // .manifest // empty' current.json)"
+          INDEX_SHA="$(jq -r '.sha256 // empty' current.json)"
+          SEQUENCE="$(jq -r '.sequence // 0' current.json)"
+          PUBLISHED_AT="$(jq -r '.publishedAt // empty' current.json)"
+
+          [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "Bad version: $VERSION"; exit 1; }
+          [[ "$INDEX_REL" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "Bad index: $INDEX_REL"; exit 1; }
+          [[ "$INDEX_REL" != *".."* ]] || { echo "Unsafe index: $INDEX_REL"; exit 1; }
+          [[ "$INDEX_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad index sha256"; exit 1; }
+
+          if [[ "$INDEX_REL" == https://* ]]; then
+            INDEX_URL="$INDEX_REL"
+          else
+            INDEX_URL="$CMS_BASE/$PACK_SLUG/$INDEX_REL"
+          fi
+
+          {
+            echo "VERSION=$VERSION"
+            echo "INDEX_SHA=$INDEX_SHA"
+            echo "INDEX_URL=$INDEX_URL"
+            echo "SEQUENCE=$SEQUENCE"
+            echo "PUBLISHED_AT=$PUBLISHED_AT"
+            echo "ZIP=raidforce-$VERSION.zip"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch and verify index
+        run: |
+          set -euo pipefail
+          cd work
+
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -H "Cache-Control: no-cache" \
+            "$INDEX_URL" -o index.json
+          echo "$INDEX_SHA  index.json" | sha256sum -c -
+          jq -e . index.json >/dev/null
+
+          COUNT="$(jq '.files | length' index.json)"
+          [[ "$COUNT" -gt 0 ]] || { echo "Empty pack index"; exit 1; }
+          echo "FILE_COUNT=$COUNT" >> "$GITHUB_ENV"
+
+      - name: Check GitHub release
+        id: check
+        run: |
+          set -euo pipefail
+          cd work
+
+          POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
+          REMOTE_VERSION=""
+          REMOTE_SHA=""
+          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json; then
+            REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
+            REMOTE_SHA="$(jq -r '.sha256 // empty' remote-pack.json)"
+          fi
+
+          ASSETS_JSON="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets 2>/dev/null || true)"
+          ASSET_SHA=""
+          if [[ -n "$ASSETS_JSON" ]]; then
+            ASSET_SHA="$(jq -r --arg name "$ZIP" \
+              '.assets[] | select(.name == $name) | .digest // empty' <<< "$ASSETS_JSON")"
+            ASSET_SHA="${ASSET_SHA#sha256:}"
+          fi
+
+          if [[ "$REMOTE_VERSION" == "$VERSION" && -n "$REMOTE_SHA" && "$ASSET_SHA" == "$REMOTE_SHA" ]]; then
+            echo "Already current: $VERSION"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Needs mirror: remote=$REMOTE_VERSION local=$VERSION"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download pack files
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p staging
+
+          jq -r '.files[] | [.path, .sha256, (.size|tostring), .urls[0]] | @tsv' index.json |
+          while IFS=$'\t' read -r path sha size url; do
+            [[ "$path" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "Bad path: $path"; exit 1; }
+            [[ "$path" != *".."* && "$path" != /* && "$path" != *"\\"* ]] || {
+              echo "Unsafe path: $path"; exit 1;
+            }
+            [[ "$sha" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad sha: $path"; exit 1; }
+            [[ "$size" =~ ^[0-9]+$ ]] || { echo "Bad size: $path"; exit 1; }
+            [[ "$url" == https://* ]] || { echo "Bad url: $path"; exit 1; }
+
+            mkdir -p "staging/$(dirname "$path")"
+            curl -fsSL --retry 3 --retry-delay 2 "$url" -o "staging/$path"
+            echo "$sha  staging/$path" | sha256sum -c -
+            actual="$(stat -c%s "staging/$path")"
+            [[ "$actual" == "$size" ]] || {
+              echo "Size mismatch: $path ($actual != $size)"; exit 1;
+            }
+          done
+
+      - name: Build zip
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+
+          python3 - <<'PY'
+          import os
+          import shutil
+          import zipfile
+
+          root = "staging"
+          out = os.environ["ZIP"]
+          entries = []
+          for base, _, names in os.walk(root):
+              for name in names:
+                  full = os.path.join(base, name)
+                  rel = os.path.relpath(full, root).replace(os.sep, "/")
+                  entries.append((rel, full))
+          entries.sort()
+
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for rel, full in entries:
+                  info = zipfile.ZipInfo.from_file(full, rel)
+                  info.date_time = (1980, 1, 1, 0, 0, 0)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o644 << 16
+                  with open(full, "rb") as src, archive.open(info, "w") as dst:
+                      shutil.copyfileobj(src, dst)
+
+          print(f"{out}: {len(entries)} files")
+          PY
+
+          unzip -t "$ZIP" >/dev/null
+          ZIP_COUNT="$(unzip -Z1 "$ZIP" | wc -l)"
+          [[ "$ZIP_COUNT" == "$FILE_COUNT" ]] || {
+            echo "Zip file count mismatch: $ZIP_COUNT != $FILE_COUNT"; exit 1;
+          }
+
+          ZIP_SHA="$(sha256sum "$ZIP" | cut -d' ' -f1)"
+          ZIP_SIZE="$(stat -c%s "$ZIP")"
+          {
+            echo "ZIP_SHA=$ZIP_SHA"
+            echo "ZIP_SIZE=$ZIP_SIZE"
+          } >> "$GITHUB_ENV"
+          echo "Built $ZIP ($ZIP_SIZE bytes, sha256 $ZIP_SHA)"
+
+      - name: Upload zip
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+
+          gh release view "$RELEASE_TAG" -R "$GH_REPO" >/dev/null 2>&1 || {
+            echo "Release $RELEASE_TAG is missing; create it once in the public repo."; exit 1;
+          }
+
+          ASSETS_JSON="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets)"
+          EXISTING="$(jq -r --arg name "$ZIP" \
+            '.assets[] | select(.name == $name) | .digest // empty' <<< "$ASSETS_JSON" \
+            | sed 's/^sha256://')"
+          ASSET_NAMES="$(jq -r '.assets[].name' <<< "$ASSETS_JSON")"
+
+          if ! grep -qxF "$ZIP" <<< "$ASSET_NAMES"; then
+            gh release upload "$RELEASE_TAG" "$ZIP" -R "$GH_REPO"
+          elif [[ "$EXISTING" == "$ZIP_SHA" ]]; then
+            echo "Asset already uploaded with the same digest"
+          else
+            gh release upload "$RELEASE_TAG" "$ZIP" -R "$GH_REPO" --clobber
+          fi
+
+      - name: Update pack.json
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+
+          ZIP_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/$ZIP"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg url "$ZIP_URL" \
+            --arg sha256 "$ZIP_SHA" \
+            --argjson size "$ZIP_SIZE" \
+            --argjson sequence "$SEQUENCE" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt}' \
+            > pack.json
+
+          gh release upload "$RELEASE_TAG" pack.json -R "$GH_REPO" --clobber
+
+      - name: Verify pointer
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+
+          POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
+          curl -fsSL --retry 3 "$POINTER_URL" -o live-pack.json
+          [[ "$(jq -r '.version // empty' live-pack.json)" == "$VERSION" ]] || {
+            echo "Live pack.json has the wrong version"; exit 1;
+          }
+          [[ "$(jq -r '.sha256 // empty' live-pack.json)" == "$ZIP_SHA" ]] || {
+            echo "Live pack.json has the wrong sha256"; exit 1;
+          }
+
+      - name: Delete old zips
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+
+          OLD_ZIPS="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets \
+            --jq '.assets[].name' \
+            | grep -E '^raidforce-.*\.zip$' \
+            | grep -vxF "$ZIP" || true)"
+
+          if [[ -n "$OLD_ZIPS" ]]; then
+            while IFS= read -r old; do
+              echo "Deleting old asset: $old"
+              gh release delete-asset "$RELEASE_TAG" "$old" -R "$GH_REPO" --yes
+            done <<< "$OLD_ZIPS"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### RAIDFORCE pack mirror"
+            echo ""
+            echo "- version: \`${VERSION:-?}\`"
+            echo "- files: \`${FILE_COUNT:-?}\`"
+            echo "- zip: \`${ZIP:-?}\`"
+            echo "- sha256: \`${ZIP_SHA:-?}\`"
+            echo "- dry run: \`${DRY_RUN:-?}\`"
+            echo "- skipped: \`${{ steps.check.outputs.skip || 'unknown' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
