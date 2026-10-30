@@ -98,7 +98,7 @@ jobs:
           POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
           REMOTE_VERSION=""
           REMOTE_SHA=""
-          if curl -fsSL --retry 2 "$POINTER_URL?t=$(date +%s)" -o remote-pack.json; then
+          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json; then
             REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
             REMOTE_SHA="$(jq -r '.sha256 // empty' remote-pack.json)"
           fi
@@ -251,7 +251,7 @@ jobs:
           POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
           ok=false
           for attempt in $(seq 1 20); do
-            if curl -fsSL --retry 2 "$POINTER_URL?t=$(date +%s)" -o live-pack.json; then
+            if curl -fsSL --retry 2 "$POINTER_URL" -o live-pack.json; then
               if [[ "$(jq -r '.version // empty' live-pack.json)" == "$VERSION" \
                  && "$(jq -r '.sha256 // empty' live-pack.json)" == "$ZIP_SHA" ]]; then
                 ok=true
