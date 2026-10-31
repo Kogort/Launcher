@@ -1,20 +1,44 @@
 name: Mirror RAIDFORCE pack
 
-# One current RAIDFORCE zip on GitHub, built from the CMS v2 index.
-# The launcher's fallback manifest is:
-#   https://github.com/Kogort/Launcher/releases/download/raidforce-modpack/pack.json
+# D-077: current RAIDFORCE version on GitHub.
+# - versioned release raidforce-<version>: 35 per-file JARs by sha256, index,
+#   current.json pointer, pack.json and the whole zip;
+# - stable pointer mirror/pack.json in the `mirror` branch (atomic git commit);
+# - only the current version is kept; old versioned releases are deleted.
 #
-# No secrets: only the repository GITHUB_TOKEN with contents:write is used.
+# The publisher triggers this workflow before switching CMS current.json and
+# waits for mirror/pack.json. A 5-minute schedule is only a reconciliation net.
 
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "Pack version (empty: take CMS current.json)"
+        required: false
+        type: string
+      index_url:
+        description: "Already uploaded CMS index URL"
+        required: false
+        type: string
+      index_sha:
+        description: "sha256 of index bytes"
+        required: false
+        type: string
+      sequence:
+        description: "Pointer sequence"
+        required: false
+        type: string
+      published_at:
+        description: "ISO publishedAt"
+        required: false
+        type: string
       dry_run:
-        description: "Build and verify only; do not upload or delete anything"
+        description: "Build and verify only; do not upload/commit/delete"
+        required: false
         type: boolean
         default: false
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -26,52 +50,67 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       PACK_SLUG: raidforce
-      RELEASE_TAG: raidforce-modpack
       CMS_BASE: https://cms.kogort.online/wp-content/uploads/kogort/pack
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+      INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+      INPUT_INDEX_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.index_url || '' }}
+      INPUT_INDEX_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.index_sha || '' }}
+      INPUT_SEQUENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.sequence || '' }}
+      INPUT_PUBLISHED_AT: ${{ github.event_name == 'workflow_dispatch' && inputs.published_at || '' }}
 
     steps:
-      - name: Fetch CMS pointer
+      - name: Resolve target version
         run: |
           set -euo pipefail
           mkdir -p work
           cd work
 
-          curl -fsSL --retry 3 --retry-delay 2 \
-            -H "Cache-Control: no-cache" \
-            "$CMS_BASE/$PACK_SLUG/current.json?t=$(date +%s)" \
-            -o current.json
-
-          jq -e . current.json >/dev/null
-          VERSION="$(jq -r '.version // empty' current.json)"
-          INDEX_REL="$(jq -r '.index // .manifest // empty' current.json)"
-          INDEX_SHA="$(jq -r '.sha256 // empty' current.json)"
-          SEQUENCE="$(jq -r '.sequence // 0' current.json)"
-          PUBLISHED_AT="$(jq -r '.publishedAt // empty' current.json)"
-
-          [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "Bad version: $VERSION"; exit 1; }
-          [[ "$INDEX_REL" =~ ^[0-9A-Za-z._/-]+$ ]] || { echo "Bad index: $INDEX_REL"; exit 1; }
-          [[ "$INDEX_REL" != *".."* ]] || { echo "Unsafe index: $INDEX_REL"; exit 1; }
-          [[ "$INDEX_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad index sha256"; exit 1; }
-
-          if [[ "$INDEX_REL" == https://* ]]; then
-            INDEX_URL="$INDEX_REL"
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="$INPUT_VERSION"
+            INDEX_URL="$INPUT_INDEX_URL"
+            INDEX_SHA="$INPUT_INDEX_SHA"
+            SEQUENCE="$INPUT_SEQUENCE"
+            PUBLISHED_AT="$INPUT_PUBLISHED_AT"
           else
-            INDEX_URL="$CMS_BASE/$PACK_SLUG/$INDEX_REL"
+            curl -fsSL --retry 3 --retry-delay 2 \
+              -H "Cache-Control: no-cache" \
+              "$CMS_BASE/$PACK_SLUG/current.json?t=$(date +%s)" \
+              -o current.json
+            jq -e . current.json >/dev/null
+            VERSION="$(jq -r '.version // empty' current.json)"
+            INDEX_REL="$(jq -r '.index // .manifest // empty' current.json)"
+            INDEX_SHA="$(jq -r '.sha256 // empty' current.json)"
+            SEQUENCE="$(jq -r '.sequence // 0' current.json)"
+            PUBLISHED_AT="$(jq -r '.publishedAt // empty' current.json)"
+            if [[ "$INDEX_REL" == https://* ]]; then
+              INDEX_URL="$INDEX_REL"
+            else
+              INDEX_URL="$CMS_BASE/$PACK_SLUG/$INDEX_REL"
+            fi
           fi
 
+          [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "Bad version: $VERSION"; exit 1; }
+          [[ "$INDEX_SHA" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad index sha"; exit 1; }
+          INDEX_SHA="$(printf '%s' "$INDEX_SHA" | tr 'A-F' 'a-f')"
+          [[ "$INDEX_URL" == https://* ]] || { echo "Bad index URL"; exit 1; }
+          [[ "$SEQUENCE" =~ ^[0-9]+$ ]] || { echo "Bad sequence"; exit 1; }
+          [[ -n "$PUBLISHED_AT" ]] || PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          TAG="raidforce-$VERSION"
           {
             echo "VERSION=$VERSION"
             echo "INDEX_SHA=$INDEX_SHA"
             echo "INDEX_URL=$INDEX_URL"
             echo "SEQUENCE=$SEQUENCE"
             echo "PUBLISHED_AT=$PUBLISHED_AT"
+            echo "TAG=$TAG"
             echo "ZIP=raidforce-$VERSION.zip"
+            echo "INDEX_ASSET=index-$VERSION.json"
           } >> "$GITHUB_ENV"
 
       - name: Fetch and verify index
@@ -85,33 +124,43 @@ jobs:
           echo "$INDEX_SHA  index.json" | sha256sum -c -
           jq -e . index.json >/dev/null
 
+          # D-077: fallback index must contain a per-file GitHub URL for every
+          # file. The publisher already adds them; for older indexes (first
+          # mirror run) append them here, preserving CMS/Modrinth order.
+          GH_BASE="https://github.com/$GH_REPO/releases/download/$TAG"
+          jq --arg base "$GH_BASE" '
+            .files |= map(
+              . as $file
+              | ($base + "/" + $file.sha256) as $github
+              | if ($file.urls | index($github)) then $file
+                else $file + {urls: ($file.urls + [$github])}
+                end
+            )
+          ' index.json > index-github.json
+          mv index-github.json index.json
+
+          GITHUB_INDEX_SHA="$(sha256sum index.json | cut -d' ' -f1)"
+          echo "GITHUB_INDEX_SHA=$GITHUB_INDEX_SHA" >> "$GITHUB_ENV"
+
           COUNT="$(jq '.files | length' index.json)"
           [[ "$COUNT" -gt 0 ]] || { echo "Empty pack index"; exit 1; }
           echo "FILE_COUNT=$COUNT" >> "$GITHUB_ENV"
 
-      - name: Check GitHub release
+      - name: Skip if already current (schedule only)
         id: check
         run: |
           set -euo pipefail
-          cd work
+          if [[ "${INPUT_VERSION}" != "" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
+          POINTER_URL="https://raw.githubusercontent.com/$GH_REPO/mirror/pack.json?t=$(date +%s)"
           REMOTE_VERSION=""
-          REMOTE_SHA=""
-          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json; then
+          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json 2>/dev/null; then
             REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
-            REMOTE_SHA="$(jq -r '.sha256 // empty' remote-pack.json)"
           fi
-
-          ASSETS_JSON="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets 2>/dev/null || true)"
-          ASSET_SHA=""
-          if [[ -n "$ASSETS_JSON" ]]; then
-            ASSET_SHA="$(jq -r --arg name "$ZIP" \
-              '.assets[] | select(.name == $name) | .digest // empty' <<< "$ASSETS_JSON")"
-            ASSET_SHA="${ASSET_SHA#sha256:}"
-          fi
-
-          if [[ "$REMOTE_VERSION" == "$VERSION" && -n "$REMOTE_SHA" && "$ASSET_SHA" == "$REMOTE_SHA" ]]; then
+          if [[ "$REMOTE_VERSION" == "$VERSION" ]]; then
             echo "Already current: $VERSION"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -126,10 +175,8 @@ jobs:
           cd work
           mkdir -p staging
 
-          jq -r '.files[] | [.path, .sha256, (.size|tostring), .urls[0]] | @tsv' index.json |
-          while IFS=$'\t' read -r path sha size url; do
-            # File names contain '+', spaces, parentheses; reject only traversal,
-            # absolute paths, backslashes and control characters.
+          jq -r '.files[] | [.path, .sha256, (.size|tostring), (.urls|join(" "))] | @tsv' index.json |
+          while IFS=$'\t' read -r path sha size urls; do
             [[ -n "$path" && "$path" != /* && "$path" != *"\\"* && "$path" != *".."* ]] || {
               echo "Unsafe path: $path"; exit 1;
             }
@@ -137,19 +184,24 @@ jobs:
               echo "Control character in path: $path"; exit 1;
             }
             [[ "$sha" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad sha: $path"; exit 1; }
+            sha="$(printf '%s' "$sha" | tr 'A-F' 'a-f')"
             [[ "$size" =~ ^[0-9]+$ ]] || { echo "Bad size: $path"; exit 1; }
-            [[ "$url" == https://* ]] || { echo "Bad url: $path"; exit 1; }
 
             mkdir -p "staging/$(dirname "$path")"
-            curl -fsSL --retry 3 --retry-delay 2 "$url" -o "staging/$path"
-            actual_sha="$(sha256sum "staging/$path" | cut -d' ' -f1)"
-            [[ "$actual_sha" == "$sha" ]] || {
-              echo "Sha mismatch: $path ($actual_sha != $sha)"; exit 1;
-            }
-            actual="$(stat -c%s "staging/$path")"
-            [[ "$actual" == "$size" ]] || {
-              echo "Size mismatch: $path ($actual != $size)"; exit 1;
-            }
+            ok=false
+            for url in $urls; do
+              [[ "$url" == https://* ]] || continue
+              if curl -fsSL --retry 2 --retry-delay 2 "$url" -o "staging/$path"; then
+                actual_sha="$(sha256sum "staging/$path" | cut -d' ' -f1)"
+                actual_size="$(stat -c%s "staging/$path")"
+                if [[ "$actual_sha" == "$sha" && "$actual_size" == "$size" ]]; then
+                  ok=true
+                  break
+                fi
+                echo "Bad bytes from $url for $path (sha=$actual_sha size=$actual_size); trying next"
+              fi
+            done
+            [[ "$ok" == "true" ]] || { echo "All sources failed: $path"; exit 1; }
           done
 
       - name: Build zip
@@ -181,55 +233,35 @@ jobs:
                   info.external_attr = 0o644 << 16
                   with open(full, "rb") as src, archive.open(info, "w") as dst:
                       shutil.copyfileobj(src, dst)
-
           print(f"{out}: {len(entries)} files")
           PY
 
           unzip -t "$ZIP" >/dev/null
-          ZIP_COUNT="$(unzip -Z1 "$ZIP" | wc -l)"
-          [[ "$ZIP_COUNT" == "$FILE_COUNT" ]] || {
-            echo "Zip file count mismatch: $ZIP_COUNT != $FILE_COUNT"; exit 1;
-          }
-
           ZIP_SHA="$(sha256sum "$ZIP" | cut -d' ' -f1)"
           ZIP_SIZE="$(stat -c%s "$ZIP")"
-          {
-            echo "ZIP_SHA=$ZIP_SHA"
-            echo "ZIP_SIZE=$ZIP_SIZE"
-          } >> "$GITHUB_ENV"
-          echo "Built $ZIP ($ZIP_SIZE bytes, sha256 $ZIP_SHA)"
+          echo "ZIP_SHA=$ZIP_SHA" >> "$GITHUB_ENV"
+          echo "ZIP_SIZE=$ZIP_SIZE" >> "$GITHUB_ENV"
 
-      - name: Upload zip
-        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+      - name: Build pointer and manifest
+        if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
           cd work
 
-          gh release view "$RELEASE_TAG" -R "$GH_REPO" >/dev/null 2>&1 || {
-            echo "Release $RELEASE_TAG is missing; create it once in the public repo."; exit 1;
-          }
+          TAG_BASE="https://github.com/$GH_REPO/releases/download/$TAG"
+          INDEX_ASSET_URL="$TAG_BASE/$INDEX_ASSET"
+          ZIP_URL="$TAG_BASE/$ZIP"
+          POINTER_URL="$TAG_BASE/current.json"
 
-          ASSETS_JSON="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets)"
-          EXISTING="$(jq -r --arg name "$ZIP" \
-            '.assets[] | select(.name == $name) | .digest // empty' <<< "$ASSETS_JSON" \
-            | sed 's/^sha256://')"
-          ASSET_NAMES="$(jq -r '.assets[].name' <<< "$ASSETS_JSON")"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg index "$INDEX_ASSET_URL" \
+            --arg sha256 "$GITHUB_INDEX_SHA" \
+            --argjson sequence "$SEQUENCE" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version:$version,index:$index,sha256:$sha256,sequence:$sequence,publishedAt:$publishedAt}' \
+            > current.json
 
-          if ! grep -qxF "$ZIP" <<< "$ASSET_NAMES"; then
-            gh release upload "$RELEASE_TAG" "$ZIP" -R "$GH_REPO"
-          elif [[ "$EXISTING" == "$ZIP_SHA" ]]; then
-            echo "Asset already uploaded with the same digest"
-          else
-            gh release upload "$RELEASE_TAG" "$ZIP" -R "$GH_REPO" --clobber
-          fi
-
-      - name: Update pack.json
-        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
-        run: |
-          set -euo pipefail
-          cd work
-
-          ZIP_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/$ZIP"
           jq -n \
             --arg version "$VERSION" \
             --arg url "$ZIP_URL" \
@@ -237,61 +269,117 @@ jobs:
             --argjson size "$ZIP_SIZE" \
             --argjson sequence "$SEQUENCE" \
             --arg publishedAt "$PUBLISHED_AT" \
-            '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt}' \
+            --arg index "$POINTER_URL" \
+            '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt,index:$index}' \
             > pack.json
 
-          gh release upload "$RELEASE_TAG" pack.json -R "$GH_REPO" --clobber
+          cp index.json "$INDEX_ASSET"
 
-      - name: Verify pointer
+      - name: Upload release
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p artifacts
+
+          jq -r '.files[].sha256' index.json | sort -u | while read -r sha; do
+            path="$(jq -r --arg sha "$sha" '.files[] | select(.sha256==$sha) | .path' index.json | head -n1)"
+            cp "staging/$path" "artifacts/$sha"
+          done
+          cp "$INDEX_ASSET" artifacts/
+          cp current.json artifacts/
+          cp pack.json artifacts/
+          cp "$ZIP" artifacts/
+
+          if gh release view "$TAG" -R "$GH_REPO" >/dev/null 2>&1; then
+            gh release delete "$TAG" -R "$GH_REPO" --yes
+          fi
+
+          gh release create "$TAG" artifacts/* \
+            -R "$GH_REPO" \
+            --title "RAIDFORCE $VERSION" \
+            --notes "Pack mirror for $VERSION (D-077). Current pointer: mirror/pack.json." \
+            --draft
+
+          gh release edit "$TAG" -R "$GH_REPO" --draft=false
+
+      - name: Verify published assets
         if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
         run: |
           set -euo pipefail
           cd work
 
-          POINTER_URL="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/pack.json"
-          ok=false
+          TAG_BASE="https://github.com/$GH_REPO/releases/download/$TAG"
           for attempt in $(seq 1 20); do
-            if curl -fsSL --retry 2 "$POINTER_URL" -o live-pack.json; then
-              if [[ "$(jq -r '.version // empty' live-pack.json)" == "$VERSION" \
-                 && "$(jq -r '.sha256 // empty' live-pack.json)" == "$ZIP_SHA" ]]; then
-                ok=true
-                break
-              fi
+            if curl -fsSL --retry 2 "$TAG_BASE/current.json" -o live-current.json \
+               && curl -fsSL --retry 2 "$TAG_BASE/pack.json" -o live-pack.json; then
+              [[ "$(jq -r '.version' live-current.json)" == "$VERSION" ]] || { sleep 3; continue; }
+              [[ "$(jq -r '.sha256' live-current.json)" == "$GITHUB_INDEX_SHA" ]] || { echo "Pointer sha mismatch"; exit 1; }
+              [[ "$(jq -r '.sha256' live-pack.json)" == "$ZIP_SHA" ]] || { echo "Manifest zip sha mismatch"; exit 1; }
+              INDEX_URL_LIVE="$(jq -r '.index' live-current.json)"
+              curl -fsSL --retry 2 "$INDEX_URL_LIVE" -o live-index.json
+              echo "$GITHUB_INDEX_SHA  live-index.json" | sha256sum -c -
+              echo "Release assets verified"
+              exit 0
             fi
-            echo "pack.json is not visible yet (attempt $attempt/20); waiting..."
+            echo "Release assets are not visible yet (attempt $attempt/20)"
             sleep 3
           done
-          [[ "$ok" == "true" ]] || {
-            echo "Live pack.json did not become visible"; exit 1;
-          }
+          echo "Release assets did not become visible"
+          exit 1
 
-      - name: Delete old zips
-        if: env.DRY_RUN != 'true' && success()
+      - name: Commit stable pointer
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
         run: |
           set -euo pipefail
+          cd work
 
-          OLD_ZIPS="$(gh release view "$RELEASE_TAG" -R "$GH_REPO" --json assets \
-            --jq '.assets[].name' \
-            | grep -E '^raidforce-.*\.zip$' \
-            | grep -vxF "$ZIP" || true)"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" repo
+          cd repo
+          git config user.name "kogort-mirror"
+          git config user.email "mirror@users.noreply.github.com"
 
-          if [[ -n "$OLD_ZIPS" ]]; then
+          git fetch --depth 1 origin mirror || true
+          if git show-ref --verify --quiet refs/remotes/origin/mirror; then
+            git checkout -B mirror origin/mirror
+          else
+            git checkout --orphan mirror
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp ../pack.json .
+          git add pack.json
+          git commit -m "mirror: $VERSION"
+          git push --force origin mirror
+
+      - name: Delete older versions
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          OLD="$(gh release list -R "$GH_REPO" --limit 100 --json tagName \
+            --jq '.[].tagName' \
+            | grep -E '^raidforce-20[0-9]' \
+            | grep -vxF "$TAG" || true)"
+          if [[ -n "$OLD" ]]; then
             while IFS= read -r old; do
-              echo "Deleting old asset: $old"
-              gh release delete-asset "$RELEASE_TAG" "$old" -R "$GH_REPO" --yes
-            done <<< "$OLD_ZIPS"
+              echo "Deleting old release: $old"
+              gh release delete "$old" -R "$GH_REPO" --yes || true
+            done <<< "$OLD"
           fi
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "### RAIDFORCE pack mirror"
+            echo "### RAIDFORCE pack mirror (D-077)"
             echo ""
             echo "- version: \`${VERSION:-?}\`"
             echo "- files: \`${FILE_COUNT:-?}\`"
-            echo "- zip: \`${ZIP:-?}\`"
-            echo "- sha256: \`${ZIP_SHA:-?}\`"
+            echo "- index sha256: \`${INDEX_SHA:-?}\`"
+            echo "- zip sha256: \`${ZIP_SHA:-?}\`"
+            echo "- tag: \`${TAG:-?}\`"
             echo "- dry run: \`${DRY_RUN:-?}\`"
             echo "- skipped: \`${{ steps.check.outputs.skip || 'unknown' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
