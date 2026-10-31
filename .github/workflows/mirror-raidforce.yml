@@ -173,9 +173,20 @@ jobs:
 
           POINTER_URL="https://raw.githubusercontent.com/$GH_REPO/mirror/pack.json?t=$(date +%s)"
           REMOTE_VERSION=""
+          REMOTE_SIGNED="false"
           if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json 2>/dev/null; then
             REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
+            REMOTE_SIGNED="$(jq -r 'if (.signature // "") | length > 0 then "true" else "false" end' remote-pack.json 2>/dev/null || echo false)"
           fi
+
+          # D-078: once the mirror is signed, a manual/scheduled run without a
+          # publisher-signed manifest must not overwrite it with an unsigned one.
+          if [[ "$REMOTE_SIGNED" == "true" && -z "${INPUT_MIRROR_PACK}" ]]; then
+            echo "Mirror is signed; refusing an unsigned update (publisher run required)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ "$REMOTE_VERSION" == "$VERSION" ]]; then
             echo "Already current: $VERSION"
             echo "skip=true" >> "$GITHUB_OUTPUT"
