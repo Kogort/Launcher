@@ -354,6 +354,46 @@ jobs:
           git commit -m "mirror: $VERSION"
           git push --force origin mirror
 
+      - name: Update legacy <=1.2.2 release
+        if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+
+          LEGACY_TAG="raidforce-modpack"
+          if ! gh release view "$LEGACY_TAG" -R "$GH_REPO" >/dev/null 2>&1; then
+            echo "Legacy release $LEGACY_TAG is missing; skipping"
+            exit 0
+          fi
+
+          mkdir -p legacy
+          cp "$ZIP" "legacy/raidforce-$VERSION.zip"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg url "https://github.com/$GH_REPO/releases/download/$LEGACY_TAG/raidforce-$VERSION.zip" \
+            --arg sha256 "$ZIP_SHA" \
+            --argjson size "$ZIP_SIZE" \
+            --argjson sequence "$SEQUENCE" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt}' \
+            > legacy/pack.json
+
+          gh release upload "$LEGACY_TAG" \
+            "legacy/raidforce-$VERSION.zip" "legacy/pack.json" \
+            -R "$GH_REPO" --clobber || {
+              echo "Legacy release update failed; new mirror is already current"; exit 0;
+            }
+
+          OLD="$(gh release view "$LEGACY_TAG" -R "$GH_REPO" --json assets \
+            --jq '.assets[].name' \
+            | grep -E '^raidforce-.*\.zip$' \
+            | grep -vxF "raidforce-$VERSION.zip" || true)"
+          if [[ -n "$OLD" ]]; then
+            while IFS= read -r old; do
+              gh release delete-asset "$LEGACY_TAG" "$old" -R "$GH_REPO" --yes || true
+            done <<< "$OLD"
+          fi
+
       - name: Delete older versions
         if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
         run: |
