@@ -32,6 +32,10 @@ on:
         description: "ISO publishedAt"
         required: false
         type: string
+      mirror_pack:
+        description: "Base64 of the signed mirror manifest skeleton (publisher)"
+        required: false
+        type: string
       dry_run:
         description: "Build and verify only; do not upload/commit/delete"
         required: false
@@ -62,6 +66,7 @@ jobs:
       INPUT_INDEX_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.index_sha || '' }}
       INPUT_SEQUENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.sequence || '' }}
       INPUT_PUBLISHED_AT: ${{ github.event_name == 'workflow_dispatch' && inputs.published_at || '' }}
+      INPUT_MIRROR_PACK: ${{ github.event_name == 'workflow_dispatch' && inputs.mirror_pack || '' }}
 
     steps:
       - name: Resolve target version
@@ -125,21 +130,32 @@ jobs:
           jq -e . index.json >/dev/null
 
           # D-077: fallback index must contain a per-file GitHub URL for every
-          # file. The publisher already adds them; for older indexes (first
-          # mirror run) append them here, preserving CMS/Modrinth order.
+          # file. The publisher already adds them. If some are missing, only an
+          # unsigned/manual run may rewrite the index; a publisher-signed run
+          # must not change bytes (D-078: index_sha256 is signed).
           GH_BASE="https://github.com/$GH_REPO/releases/download/$TAG"
-          jq --arg base "$GH_BASE" '
-            .files |= map(
-              . as $file
-              | ($base + "/" + $file.sha256) as $github
-              | if ($file.urls | index($github)) then $file
-                else $file + {urls: ($file.urls + [$github])}
-                end
-            )
-          ' index.json > index-github.json
-          mv index-github.json index.json
-
-          GITHUB_INDEX_SHA="$(sha256sum index.json | cut -d' ' -f1)"
+          MISSING="$(jq --arg base "$GH_BASE" \
+            '[.files[] | (.sha256) as $sha | select((.urls | index($base + "/" + $sha)) == null)] | length' \
+            index.json)"
+          if [[ "$MISSING" -gt 0 ]]; then
+            if [[ -n "${INPUT_MIRROR_PACK}" ]]; then
+              echo "Signed run: $MISSING file(s) have no GitHub URL; publisher must add them" >&2
+              exit 1
+            fi
+            jq --arg base "$GH_BASE" '
+              .files |= map(
+                . as $file
+                | ($base + "/" + $file.sha256) as $github
+                | if ($file.urls | index($github)) then $file
+                  else $file + {urls: ($file.urls + [$github])}
+                  end
+              )
+            ' index.json > index-github.json
+            mv index-github.json index.json
+            GITHUB_INDEX_SHA="$(sha256sum index.json | cut -d' ' -f1)"
+          else
+            GITHUB_INDEX_SHA="$INDEX_SHA"
+          fi
           echo "GITHUB_INDEX_SHA=$GITHUB_INDEX_SHA" >> "$GITHUB_ENV"
 
           COUNT="$(jq '.files | length' index.json)"
@@ -262,16 +278,33 @@ jobs:
             '{version:$version,index:$index,sha256:$sha256,sequence:$sequence,publishedAt:$publishedAt}' \
             > current.json
 
-          jq -n \
-            --arg version "$VERSION" \
-            --arg url "$ZIP_URL" \
-            --arg sha256 "$ZIP_SHA" \
-            --argjson size "$ZIP_SIZE" \
-            --argjson sequence "$SEQUENCE" \
-            --arg publishedAt "$PUBLISHED_AT" \
-            --arg index "$POINTER_URL" \
-            '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt,index:$index}' \
-            > pack.json
+          if [[ -n "${INPUT_MIRROR_PACK}" ]]; then
+            # D-078: publisher signed version/index/index_sha256/sequence/publishedAt.
+            # url, sha256 (zip) and size are added after signing and are not
+            # part of the signature payload.
+            echo "$INPUT_MIRROR_PACK" | base64 -d > pack-base.json
+            jq -e . pack-base.json >/dev/null
+            [[ "$(jq -r '.version' pack-base.json)" == "$VERSION" ]] || {
+              echo "Signed manifest version mismatch"; exit 1; }
+            [[ "$(jq -r '.sequence' pack-base.json)" == "$SEQUENCE" ]] || {
+              echo "Signed manifest sequence mismatch"; exit 1; }
+            [[ "$(jq -r '.index_sha256' pack-base.json)" == "$GITHUB_INDEX_SHA" ]] || {
+              echo "Signed index sha does not match GitHub index"; exit 1; }
+            jq --arg url "$ZIP_URL" --arg sha256 "$ZIP_SHA" --argjson size "$ZIP_SIZE" \
+              '. + {url:$url, sha256:$sha256, size:$size}' \
+              pack-base.json > pack.json
+          else
+            jq -n \
+              --arg version "$VERSION" \
+              --arg url "$ZIP_URL" \
+              --arg sha256 "$ZIP_SHA" \
+              --argjson size "$ZIP_SIZE" \
+              --argjson sequence "$SEQUENCE" \
+              --arg publishedAt "$PUBLISHED_AT" \
+              --arg index "$POINTER_URL" \
+              '{version:$version,url:$url,sha256:$sha256,size:$size,sequence:$sequence,publishedAt:$publishedAt,index:$index}' \
+              > pack.json
+          fi
 
           cp index.json "$INDEX_ASSET"
 
