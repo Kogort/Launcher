@@ -3,7 +3,7 @@
   "servers": [
     {
       "name": "Kogort Hub",
-      "ip": "hub.kogort.online"
+      "ip": "195.58.152.20:25739"
     }
   ]
 }
