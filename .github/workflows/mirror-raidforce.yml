@@ -632,7 +632,9 @@ jobs:
             git rm -rf . >/dev/null 2>&1 || true
           fi
 
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          # The launcher publisher writes mirror/launcher.json (fallback
+          # update manifest). Do not delete it with the pack pointer cleanup.
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name 'launcher.json' -exec rm -rf {} +
           cp ../pack.json .
           git add pack.json
           git commit -m "mirror: $VERSION"
