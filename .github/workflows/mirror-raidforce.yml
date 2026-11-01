@@ -1,13 +1,18 @@
 name: Mirror RAIDFORCE pack
 
-# D-077: current RAIDFORCE version on GitHub.
-# - versioned release raidforce-<version>: 35 per-file JARs by sha256, index,
-#   current.json pointer, pack.json and the whole zip;
+# D-087: GitHub mirror of the current RAIDFORCE pack.
+# - stable content-addressed file store `raidforce-files`: one asset per sha256,
+#   only the current index's files are kept; old blobs are deleted after the
+#   pointer switches;
+# - versioned release `raidforce-<version>`: index, current.json, pack.json, zip;
 # - stable pointer mirror/pack.json in the `mirror` branch (atomic git commit);
-# - only the current version is kept; old versioned releases are deleted.
+# - the publisher saves the signed manifest in the mirror-pending branch, so a
+#   scheduled run can finish a signed mirror after a failed dispatch.
 #
 # The publisher triggers this workflow before switching CMS current.json and
-# waits for mirror/pack.json. A 5-minute schedule is only a reconciliation net.
+# waits for mirror/pack.json. A 5-minute schedule is the reconciliation net.
+# Legacy publishers still emit per-version file URLs; the workflow keeps a
+# versioned mode during the transition.
 
 on:
   workflow_dispatch:
@@ -60,6 +65,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
       PACK_SLUG: raidforce
       CMS_BASE: https://cms.kogort.online/wp-content/uploads/kogort/pack
+      STORE_TAG: raidforce-files
+      PENDING_BRANCH: mirror-pending
+      PENDING_FILE: pending-pack.json
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
       INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
       INPUT_INDEX_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.index_url || '' }}
@@ -116,9 +124,59 @@ jobs:
             echo "TAG=$TAG"
             echo "ZIP=raidforce-$VERSION.zip"
             echo "INDEX_ASSET=index-$VERSION.json"
+            echo "STORE_BASE=https://github.com/$GH_REPO/releases/download/$STORE_TAG"
+            echo "VERSION_BASE=https://github.com/$GH_REPO/releases/download/$TAG"
           } >> "$GITHUB_ENV"
 
+          # D-087: the publisher passes the signed manifest directly. A scheduled
+          # run gets it from the mirror-pending branch (pending-pack.json) below.
+          if [[ -n "${INPUT_MIRROR_PACK}" ]]; then
+            echo "MIRROR_PACK=$INPUT_MIRROR_PACK" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve signed manifest
+        run: |
+          set -euo pipefail
+          cd work
+
+          if [[ -n "${MIRROR_PACK:-}" ]]; then
+            echo "Signed manifest provided by the publisher"
+            exit 0
+          fi
+
+          PENDING=""
+          if PENDING_B64=$(gh api "repos/$GH_REPO/contents/$PENDING_FILE?ref=$PENDING_BRANCH" \
+              --jq '.content' 2>/dev/null); then
+            PENDING=$(printf '%s' "$PENDING_B64" | base64 -d)
+          fi
+
+          if [[ -z "$PENDING" ]]; then
+            echo "No pending signed manifest; continuing without it"
+            exit 0
+          fi
+
+          if ! jq -e . <<<"$PENDING" >/dev/null 2>&1; then
+            echo "Pending manifest is not valid JSON; ignoring"
+            exit 0
+          fi
+
+          P_VERSION="$(jq -r '.version // empty' <<<"$PENDING")"
+          P_SHA="$(jq -r '.index_sha256 // empty' <<<"$PENDING")"
+          P_SEQUENCE="$(jq -r '.sequence // empty' <<<"$PENDING")"
+
+          if [[ "$P_VERSION" == "$VERSION" \
+             && "$P_SHA" == "$INDEX_SHA" \
+             && "$P_SEQUENCE" == "$SEQUENCE" ]]; then
+            B64="$(printf '%s' "$PENDING" | base64 | tr -d '\n')"
+            echo "MIRROR_PACK=$B64" >> "$GITHUB_ENV"
+            echo "Using pending signed manifest for $VERSION (sequence=$SEQUENCE)"
+          else
+            echo "Pending manifest does not match CMS current" \
+                 "(version=$P_VERSION sha=$P_SHA sequence=$P_SEQUENCE)"
+          fi
+
       - name: Fetch and verify index
+        id: index
         run: |
           set -euo pipefail
           cd work
@@ -129,20 +187,33 @@ jobs:
           echo "$INDEX_SHA  index.json" | sha256sum -c -
           jq -e . index.json >/dev/null
 
-          # D-077: fallback index must contain a per-file GitHub URL for every
-          # file. The publisher already adds them. If some are missing, only an
-          # unsigned/manual run may rewrite the index; a publisher-signed run
-          # must not change bytes (D-078: index_sha256 is signed).
-          GH_BASE="https://github.com/$GH_REPO/releases/download/$TAG"
-          MISSING="$(jq --arg base "$GH_BASE" \
+          # D-087: every file must have a URL in the content-addressed store.
+          # A signed run must not rewrite the index (index_sha256 is signed).
+          # Legacy publishers still emit per-version file URLs; accept that
+          # shape during the transition and keep the old upload path.
+          MISSING_STORE="$(jq --arg base "$STORE_BASE" \
             '[.files[] | (.sha256) as $sha | select((.urls | index($base + "/" + $sha)) == null)] | length' \
             index.json)"
-          if [[ "$MISSING" -gt 0 ]]; then
-            if [[ -n "${INPUT_MIRROR_PACK}" ]]; then
-              echo "Signed run: $MISSING file(s) have no GitHub URL; publisher must add them" >&2
+          MISSING_VERSION="$(jq --arg base "$VERSION_BASE" \
+            '[.files[] | (.sha256) as $sha | select((.urls | index($base + "/" + $sha)) == null)] | length' \
+            index.json)"
+
+          if [[ "$MISSING_STORE" -eq 0 ]]; then
+            MODE=store
+            GITHUB_INDEX_SHA="$INDEX_SHA"
+            echo "Index mode: content-addressed store"
+          elif [[ "$MISSING_VERSION" -eq 0 ]]; then
+            MODE=version
+            GITHUB_INDEX_SHA="$INDEX_SHA"
+            echo "Index mode: legacy per-version assets (transition)"
+          else
+            if [[ -n "${MIRROR_PACK:-}" ]]; then
+              echo "Signed run: $MISSING_STORE file(s) have no store URL and" \
+                   "$MISSING_VERSION have no versioned URL; publisher must add GitHub URLs" >&2
               exit 1
             fi
-            jq --arg base "$GH_BASE" '
+
+            jq --arg base "$STORE_BASE" '
               .files |= map(
                 . as $file
                 | ($base + "/" + $file.sha256) as $github
@@ -152,48 +223,194 @@ jobs:
               )
             ' index.json > index-github.json
             mv index-github.json index.json
+            MODE=store
             GITHUB_INDEX_SHA="$(sha256sum index.json | cut -d' ' -f1)"
-          else
-            GITHUB_INDEX_SHA="$INDEX_SHA"
+            echo "Index mode: content-addressed store (URLs added by workflow)"
           fi
+
           echo "GITHUB_INDEX_SHA=$GITHUB_INDEX_SHA" >> "$GITHUB_ENV"
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
           COUNT="$(jq '.files | length' index.json)"
           [[ "$COUNT" -gt 0 ]] || { echo "Empty pack index"; exit 1; }
           echo "FILE_COUNT=$COUNT" >> "$GITHUB_ENV"
 
-      - name: Skip if already current (schedule only)
+      - name: Read remote pointer
+        id: remote
+        run: |
+          set -euo pipefail
+          cd work
+
+          REMOTE_VERSION=""
+          REMOTE_SIGNED="false"
+          REMOTE_URL="repos/$GH_REPO/contents/pack.json?ref=mirror"
+
+          if REMOTE_B64=$(gh api "$REMOTE_URL" --jq '.content' 2>/dev/null); then
+            printf '%s' "$REMOTE_B64" | base64 -d > remote-pack.json
+            REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
+            REMOTE_SIGNED="$(jq -r 'if (.signature // "") | length > 0 then "true" else "false" end' remote-pack.json)"
+          else
+            # Missing pointer is fine; an API failure must not be mistaken for
+            # an unsigned mirror and overwrite a signed one.
+            set +e
+            gh api "$REMOTE_URL" >/dev/null 2>remote-error.txt
+            RC=$?
+            set -e
+            if [[ "$RC" -ne 0 ]] && ! grep -q 'HTTP 404' remote-error.txt; then
+              echo "Cannot read mirror pointer:" >&2
+              cat remote-error.txt >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "REMOTE_VERSION=$REMOTE_VERSION"
+            echo "REMOTE_SIGNED=$REMOTE_SIGNED"
+          } >> "$GITHUB_ENV"
+          echo "version=$REMOTE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "signed=$REMOTE_SIGNED" >> "$GITHUB_OUTPUT"
+          echo "Remote mirror: version=${REMOTE_VERSION:-none}, signed=$REMOTE_SIGNED"
+
+      - name: Decide mirror action
         id: check
         run: |
           set -euo pipefail
-          if [[ "${INPUT_VERSION}" != "" ]]; then
+
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            if [[ "${REMOTE_SIGNED}" == "true" \
+               && -z "${MIRROR_PACK:-}" \
+               && "${DRY_RUN}" != "true" ]]; then
+              echo "Signed mirror requires mirror_pack; refusing an unsigned manual update" >&2
+              exit 1
+            fi
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "assets_only=false" >> "$GITHUB_OUTPUT"
+            echo "Pointer update: manual/publisher run"
             exit 0
           fi
 
-          POINTER_URL="https://raw.githubusercontent.com/$GH_REPO/mirror/pack.json?t=$(date +%s)"
-          REMOTE_VERSION=""
-          REMOTE_SIGNED="false"
-          if curl -fsSL --retry 2 "$POINTER_URL" -o remote-pack.json 2>/dev/null; then
-            REMOTE_VERSION="$(jq -r '.version // empty' remote-pack.json)"
-            REMOTE_SIGNED="$(jq -r 'if (.signature // "") | length > 0 then "true" else "false" end' remote-pack.json 2>/dev/null || echo false)"
-          fi
-
-          # D-078: once the mirror is signed, a manual/scheduled run without a
-          # publisher-signed manifest must not overwrite it with an unsigned one.
-          if [[ "$REMOTE_SIGNED" == "true" && -z "${INPUT_MIRROR_PACK}" ]]; then
-            echo "Mirror is signed; refusing an unsigned update (publisher run required)"
+          # D-078/D-087: a signed mirror may only be advanced by a matching
+          # publisher-signed manifest. Without it, repair assets but keep the
+          # pointer untouched.
+          if [[ "${REMOTE_SIGNED}" == "true" && -z "${MIRROR_PACK:-}" ]]; then
+            echo "Signed mirror without matching manifest: assets only, pointer stays"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "assets_only=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [[ "$REMOTE_VERSION" == "$VERSION" ]]; then
+          if [[ "${REMOTE_VERSION}" == "$VERSION" ]]; then
             echo "Already current: $VERSION"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "assets_only=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Needs mirror: remote=$REMOTE_VERSION local=$VERSION"
+            echo "Needs mirror: remote=${REMOTE_VERSION:-none} local=$VERSION"
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "assets_only=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Sync current file store
+        if: steps.index.outputs.mode == 'store'
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p store
+
+          jq -r '.files[].sha256' index.json | tr 'A-F' 'a-f' | sort -u > shas.txt
+          TARGET_COUNT="$(wc -l < shas.txt)"
+
+          STORE_EXISTS=false
+          if gh release view "$STORE_TAG" -R "$GH_REPO" >/dev/null 2>&1; then
+            STORE_EXISTS=true
+          elif [[ "$DRY_RUN" != "true" ]]; then
+            gh release create "$STORE_TAG" -R "$GH_REPO" \
+              --title "RAIDFORCE files" \
+              --notes "Machine-managed content-addressed store of the current RAIDFORCE pack (D-087). Only files from the current index are kept; do not edit manually." \
+              --latest=false
+            STORE_EXISTS=true
+          fi
+
+          if [[ "$STORE_EXISTS" == "true" ]]; then
+            gh api "repos/$GH_REPO/releases/tags/$STORE_TAG" --jq '.id' > store-id.txt
+            if [[ "$(gh api "repos/$GH_REPO/releases/$(cat store-id.txt)" --jq '.immutable // false')" == "true" ]]; then
+              echo "Store release is immutable; release immutability must be disabled" >&2
+              exit 1
+            fi
+            gh api "repos/$GH_REPO/releases/$(cat store-id.txt)/assets?per_page=100" \
+              --paginate --jq '.[].name' | sort -u > store-assets.txt
+          else
+            : > store-assets.txt
+          fi
+
+          comm -23 shas.txt store-assets.txt > missing.txt || true
+          MISSING_COUNT="$(wc -l < missing.txt)"
+          PRESENT_COUNT="$(comm -12 shas.txt store-assets.txt | wc -l)"
+          echo "Store: target=$TARGET_COUNT, present=$PRESENT_COUNT, missing=$MISSING_COUNT"
+          echo "STORE_MISSING=$MISSING_COUNT" >> "$GITHUB_ENV"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "DRY_RUN: store sync skipped (missing=$MISSING_COUNT)"
+            exit 0
+          fi
+
+          if [[ "$MISSING_COUNT" -gt 0 ]]; then
+            jq -r '.files[] | [.sha256, (.size|tostring), (.urls|join(" "))] | @tsv' index.json |
+            while IFS=$'\t' read -r sha size urls; do
+              [[ "$sha" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "Bad sha: $sha"; exit 1; }
+              sha="$(printf '%s' "$sha" | tr 'A-F' 'a-f')"
+              [[ "$size" =~ ^[0-9]+$ ]] || { echo "Bad size: $sha"; exit 1; }
+              if ! grep -qxF "$sha" missing.txt; then
+                continue
+              fi
+              if [[ -f "store/$sha" ]]; then
+                continue
+              fi
+
+              ok=false
+              for url in $urls; do
+                [[ "$url" == https://* ]] || continue
+                if curl -fsSL --retry 2 --retry-delay 2 "$url" -o "store/$sha"; then
+                  actual_sha="$(sha256sum "store/$sha" | cut -d' ' -f1)"
+                  actual_size="$(stat -c%s "store/$sha")"
+                  if [[ "$actual_sha" == "$sha" && "$actual_size" == "$size" ]]; then
+                    ok=true
+                    break
+                  fi
+                  echo "Bad bytes for $sha from $url (sha=$actual_sha size=$actual_size)"
+                fi
+              done
+              [[ "$ok" == "true" ]] || { echo "All sources failed for $sha"; exit 1; }
+            done
+
+            gh release upload "$STORE_TAG" store/* -R "$GH_REPO" || {
+              echo "Store upload failed; retrying still-missing assets"
+              gh api "repos/$GH_REPO/releases/tags/$STORE_TAG" --jq '.id' > store-id.txt
+              gh api "repos/$GH_REPO/releases/$(cat store-id.txt)/assets?per_page=100" \
+                --paginate --jq '.[].name' | sort -u > store-assets.txt
+              comm -23 shas.txt store-assets.txt > still-missing.txt || true
+              args=()
+              while IFS= read -r sha; do
+                if [[ -f "store/$sha" ]]; then
+                  args+=("store/$sha")
+                fi
+              done < still-missing.txt
+              if [[ ${#args[@]} -gt 0 ]]; then
+                gh release upload "$STORE_TAG" "${args[@]}" -R "$GH_REPO"
+              fi
+            }
+          fi
+
+          gh api "repos/$GH_REPO/releases/tags/$STORE_TAG" --jq '.id' > store-id.txt
+          gh api "repos/$GH_REPO/releases/$(cat store-id.txt)/assets?per_page=100" \
+            --paginate --jq '.[].name' | sort -u > store-assets.txt
+          comm -23 shas.txt store-assets.txt > still-missing.txt || true
+          if [[ -s still-missing.txt ]]; then
+            echo "Store is incomplete after upload:" >&2
+            cat still-missing.txt >&2
+            exit 1
+          fi
+          echo "Store complete: $TARGET_COUNT file(s)"
 
       - name: Download pack files
         if: steps.check.outputs.skip != 'true'
@@ -215,6 +432,17 @@ jobs:
             [[ "$size" =~ ^[0-9]+$ ]] || { echo "Bad size: $path"; exit 1; }
 
             mkdir -p "staging/$(dirname "$path")"
+            if [[ -f "store/$sha" ]]; then
+              cp "store/$sha" "staging/$path"
+              actual_sha="$(sha256sum "staging/$path" | cut -d' ' -f1)"
+              actual_size="$(stat -c%s "staging/$path")"
+              if [[ "$actual_sha" == "$sha" && "$actual_size" == "$size" ]]; then
+                continue
+              fi
+              echo "Bad store bytes for $path; downloading"
+              rm -f "staging/$path"
+            fi
+
             ok=false
             for url in $urls; do
               [[ "$url" == https://* ]] || continue
@@ -289,11 +517,11 @@ jobs:
             '{version:$version,index:$index,sha256:$sha256,sequence:$sequence,publishedAt:$publishedAt}' \
             > current.json
 
-          if [[ -n "${INPUT_MIRROR_PACK}" ]]; then
+          if [[ -n "${MIRROR_PACK:-}" ]]; then
             # D-078: publisher signed version/index/index_sha256/sequence/publishedAt.
             # url, sha256 (zip) and size are added after signing and are not
             # part of the signature payload.
-            echo "$INPUT_MIRROR_PACK" | base64 -d > pack-base.json
+            echo "$MIRROR_PACK" | base64 -d > pack-base.json
             jq -e . pack-base.json >/dev/null
             [[ "$(jq -r '.version' pack-base.json)" == "$VERSION" ]] || {
               echo "Signed manifest version mismatch"; exit 1; }
@@ -323,13 +551,22 @@ jobs:
         if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
         run: |
           set -euo pipefail
+          MODE="${{ steps.index.outputs.mode }}"
           cd work
           mkdir -p artifacts
 
-          jq -r '.files[].sha256' index.json | sort -u | while read -r sha; do
-            path="$(jq -r --arg sha "$sha" '.files[] | select(.sha256==$sha) | .path' index.json | head -n1)"
-            cp "staging/$path" "artifacts/$sha"
-          done
+          # Legacy mode: the index points to per-version assets, so they must be
+          # uploaded into the versioned release. Store mode keeps blobs in the
+          # stable store and publishes only metadata + zip here.
+          if [[ "$MODE" == "version" ]]; then
+            jq -r '.files[].sha256' index.json | tr 'A-F' 'a-f' | sort -u | while read -r sha; do
+              path="$(jq -r --arg sha "$sha" \
+                '.files[] | select((.sha256|ascii_downcase)==$sha) | .path' \
+                index.json | head -n1)"
+              cp "staging/$path" "artifacts/$sha"
+            done
+          fi
+
           cp "$INDEX_ASSET" artifacts/
           cp current.json artifacts/
           cp pack.json artifacts/
@@ -342,10 +579,13 @@ jobs:
           gh release create "$TAG" artifacts/* \
             -R "$GH_REPO" \
             --title "RAIDFORCE $VERSION" \
-            --notes "Pack mirror for $VERSION (D-077). Current pointer: mirror/pack.json." \
+            --notes "Pack mirror for $VERSION (D-087). Current pointer: mirror/pack.json." \
             --draft
 
+          # The stable file store must not be the repository's "Latest" release.
           gh release edit "$TAG" -R "$GH_REPO" --draft=false
+          gh release edit "$TAG" -R "$GH_REPO" --latest \
+            || echo "Warning: could not mark $TAG as latest"
 
       - name: Verify published assets
         if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
@@ -397,6 +637,43 @@ jobs:
           git add pack.json
           git commit -m "mirror: $VERSION"
           git push --force origin mirror
+
+      - name: Prune file store to current index
+        if: steps.index.outputs.mode == 'store' && env.DRY_RUN != 'true' && (steps.check.outputs.skip != 'true' || steps.check.outputs.assets_only == 'false')
+        run: |
+          set -euo pipefail
+          cd work
+
+          jq -r '.files[].sha256' index.json | tr 'A-F' 'a-f' | sort -u > keep.txt
+          gh api "repos/$GH_REPO/releases/tags/$STORE_TAG" --jq '.id' > store-id.txt
+          gh api "repos/$GH_REPO/releases/$(cat store-id.txt)/assets?per_page=100" \
+            --paginate --jq '.[] | [.id, .name] | @tsv' > store-assets.tsv
+
+          removed=0
+          while IFS=$'\t' read -r id name; do
+            if [[ ! "$name" =~ ^[0-9a-f]{64}$ ]]; then
+              continue
+            fi
+            if ! grep -qxF "$name" keep.txt; then
+              if gh api --method DELETE "repos/$GH_REPO/releases/assets/$id" >/dev/null; then
+                removed=$((removed + 1))
+              else
+                echo "Failed to delete old store asset: $name"
+              fi
+            fi
+          done < store-assets.tsv
+
+          echo "Pruned $removed old file(s); store now matches $VERSION"
+          echo "STORE_PRUNED=$removed" >> "$GITHUB_ENV"
+
+          gh api "repos/$GH_REPO/releases/$(cat store-id.txt)/assets?per_page=100" \
+            --paginate --jq '.[].name' | sort -u > remaining.txt
+          comm -23 keep.txt remaining.txt > store-broken.txt || true
+          if [[ -s store-broken.txt ]]; then
+            echo "Store lost current files after pruning:" >&2
+            cat store-broken.txt >&2
+            exit 1
+          fi
 
       - name: Update legacy <=1.2.2 release
         if: steps.check.outputs.skip != 'true' && env.DRY_RUN != 'true'
@@ -457,13 +734,16 @@ jobs:
         if: always()
         run: |
           {
-            echo "### RAIDFORCE pack mirror (D-077)"
+            echo "### RAIDFORCE pack mirror (D-087)"
             echo ""
             echo "- version: \`${VERSION:-?}\`"
             echo "- files: \`${FILE_COUNT:-?}\`"
+            echo "- mode: \`${{ steps.index.outputs.mode || '?' }}\`"
             echo "- index sha256: \`${INDEX_SHA:-?}\`"
             echo "- zip sha256: \`${ZIP_SHA:-?}\`"
             echo "- tag: \`${TAG:-?}\`"
+            echo "- store: missing=\`${STORE_MISSING:-?}\`, pruned=\`${STORE_PRUNED:-0}\`"
+            echo "- remote: \`${REMOTE_VERSION:-none}\` (signed=\`${REMOTE_SIGNED:-?}\`)"
             echo "- dry run: \`${DRY_RUN:-?}\`"
             echo "- skipped: \`${{ steps.check.outputs.skip || 'unknown' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
