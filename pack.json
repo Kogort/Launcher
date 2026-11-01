@@ -1,0 +1,12 @@
+{
+  "version": "2026.11.01-191712",
+  "index": "https://github.com/Kogort/Launcher/releases/download/raidforce-2026.11.01-191712/index-2026.11.01-191712.json",
+  "index_sha256": "bf153ae6ba3ed7a75a6efb10042cb931ff4c03bf32d156c7fd386288f3051d03",
+  "sequence": 7,
+  "publishedAt": "2026-11-01T16:17:53.9262523+00:00",
+  "keyId": "k1",
+  "signature": "KfwzWRDBIoRdJR/GSzDoT15Uuv6fEzoEPo4uH3JMA+DOjhed+LP2pHsR4XAN+JRbBZ1KWGLG96vuq2x+w4ycmg==",
+  "url": "https://github.com/Kogort/Launcher/releases/download/raidforce-2026.11.01-191712/raidforce-2026.11.01-191712.zip",
+  "sha256": "1a94eea5be78e5181ab964f5199d188d9412f3d20794f318681575252094ceac",
+  "size": 232584069
+}
