@@ -1,9 +1,17 @@
 {
-  "version": 4,
+  "version": 5,
   "servers": [
     {
-      "name": "Kogort Hub",
+      "name": "Основной",
       "ip": "hub.kogort.online"
+    },
+    {
+      "name": "Резервный",
+      "ip": "hub.2.kogort.online"
+    },
+    {
+      "name": "Резервный (2)",
+      "ip": "195.58.152.20:25739"
     }
   ]
 }
