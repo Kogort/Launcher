@@ -1,9 +1,9 @@
 {
-  "version": 3,
+  "version": 4,
   "servers": [
     {
       "name": "Kogort Hub",
-      "ip": "195.58.152.20:25739"
+      "ip": "hub.kogort.online"
     }
   ]
 }
